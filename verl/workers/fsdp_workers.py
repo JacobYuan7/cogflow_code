@@ -1494,15 +1494,13 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         self.reward_module = self._build_model(config=self.config)
 
     def _forward_micro_batch(self, micro_batch):
-        if is_cuda_available:
+        if is_cuda_available():
             from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-        elif is_npu_available:
+        elif is_npu_available():
             from transformers.integrations.npu_flash_attention import (
-                index_first_axis,
-                pad_input,
-                rearrange,
-                unpad_input,
+                index_first_axis, pad_input, rearrange, unpad_input
             )
+
 
         from verl.utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 
@@ -1592,7 +1590,7 @@ class RewardModelWorker(Worker, DistProfilerExtension):
         rm_attention_mask = []
 
         for i in range(data.batch.batch_size[0]):
-            if not isinstance(data.non_tensor_batch["raw_prompt"][i], list | np.ndarray):
+            if not isinstance(data.non_tensor_batch["raw_prompt"][i], (list, np.ndarray)):
                 raise TypeError(
                     f"raw_prompt must be a list or numpy array, got {type(data.non_tensor_batch['raw_prompt'][i])}"
                 )
@@ -1766,3 +1764,439 @@ class AsyncActorRolloutRefWorker(ActorRolloutRefWorker):
         await self.rollout.sleep()
         # return something to block the caller
         return True
+
+
+import copy
+import torch
+import torch.nn.functional as F
+
+from verl import DataProto
+from verl.utils.model import compute_position_id_with_mask
+
+from reward.vgpo_reward import (
+    extract_xml_block,
+    para_reward_score,   # VPR (your line matching reward)
+    vsr_score
+)
+
+def _ensure_tag_closed(text: str, tag: str) -> str:
+    if not text:
+        return ""
+    open_tag = f"<{tag}>"
+    close_tag = f"</{tag}>"
+    if open_tag.lower() not in text.lower():
+        return text
+    if close_tag.lower() not in text.lower():
+        return text + close_tag
+    return text
+
+def _decode_responses(tokenizer, responses: torch.Tensor, attention_mask: torch.Tensor) -> list[str]:
+    # responses: (B, T)
+    # attention_mask for responses part should be 1/0
+    out = []
+    B = responses.size(0)
+    for i in range(B):
+        valid_len = int(attention_mask[i].sum().item())
+        ids = responses[i, :valid_len].tolist()
+        out.append(tokenizer.decode(ids, skip_special_tokens=False))
+    return out
+
+def _pad_to_max_len(seqs: list[torch.Tensor], pad_id: int) -> torch.Tensor:
+    max_len = max(int(x.numel()) for x in seqs) if len(seqs) > 0 else 0
+    if max_len == 0:
+        return torch.empty((len(seqs), 0), dtype=torch.long, device=seqs[0].device if seqs else "cpu")
+    out = torch.full((len(seqs), max_len), pad_id, dtype=torch.long, device=seqs[0].device)
+    for i, x in enumerate(seqs):
+        out[i, : x.numel()] = x
+    return out
+
+def _expand_list_to_bn(x, bn: int, n: int, fill=None):
+    """
+    Expand list-like non-tensor field from B -> B*n (bn).
+    Supports: list / tuple / np.ndarray / scalar / None.
+    """
+    if x is None:
+        return [fill] * bn
+
+    if isinstance(x, np.ndarray):
+        x = x.tolist()
+
+    # scalar -> repeat
+    if not isinstance(x, (list, tuple)):
+        return [x] * bn
+
+    x = list(x)
+    if len(x) == bn:
+        return x
+    if len(x) == 1:
+        return x * bn
+
+    # typical case: B -> B*n
+    if len(x) * n == bn:
+        out = []
+        for v in x:
+            out.extend([v] * n)
+        return out
+
+    # fallback: cycle
+    out = []
+    while len(out) < bn:
+        out.extend(x)
+    return out[:bn]
+
+
+def _expand_tensor_to_bn(x: torch.Tensor, bn: int, n: int) -> torch.Tensor:
+
+    if x is None:
+        return None
+    if not torch.is_tensor(x):
+        return x
+    if x.size(0) == bn:
+        return x
+    if x.size(0) * n == bn:
+        return x.repeat_interleave(n, dim=0)
+
+    rep = bn // x.size(0) + 1
+    x2 = x.repeat((rep,) + (1,) * (x.dim() - 1))
+    return x2[:bn]
+
+
+def _expand_dataproto_to_bn(dp: DataProto, bn: int, n: int) -> DataProto:
+
+    dp2 = copy.deepcopy(dp)
+
+    # 1) expand tensor batch
+    for k in list(dp2.batch.keys()):
+        v = dp2.batch[k]
+        if torch.is_tensor(v) and v.size(0) != bn:
+            dp2.batch[k] = _expand_tensor_to_bn(v, bn=bn, n=n)
+
+    # 2) expand non_tensor_batch
+    if hasattr(dp2, "non_tensor_batch") and dp2.non_tensor_batch is not None:
+        new_ntb = {}
+        for k, v in dp2.non_tensor_batch.items():
+            if isinstance(v, (list, tuple, np.ndarray)) and len(v) != bn:
+                new_ntb[k] = _expand_list_to_bn(v, bn=bn, n=n, fill=None)
+            else:
+                new_ntb[k] = v
+        dp2.non_tensor_batch = new_ntb
+
+    return dp2
+
+
+class VGPOActorRolloutRefWorker(ActorRolloutRefWorker):
+    """
+    VGPO rollout:
+      - Sample WATCHING multiple times and pick best by visual gate (VSR+VPR)
+      - Then generate THINKING+ANSWER conditioned on selected WATCHING
+    """
+
+    def _get_vgpo_cfg(self):
+        return self.config.rollout.get("vgpo", {}) or {}
+
+    def _with_rollout_overrides(self, prompts: DataProto, sampling_overrides: dict) -> DataProto:
+        """
+        RolloutWorker.generate_sequences must read meta_info overrides.
+        If your RolloutWorker does not support this yet, you must patch it to use meta_info fields.
+        """
+        dp = copy.deepcopy(prompts)
+        dp.meta_info = dict(dp.meta_info) if dp.meta_info is not None else {}
+        dp.meta_info["sampling_overrides"] = sampling_overrides
+        return dp
+
+    def _gate_score(self, gt_text: str, pred_watch_text: str, image_info=None) -> float:
+        """
+        Svis = w_vpr * VPR + w_vsr * VSR
+        - VPR uses GT watching text (from ground_truth)
+        - VSR uses image embedding similarity (original image vs rendered watching image)
+        """
+        vgpo_cfg = self._get_vgpo_cfg()
+
+        use_vpr = bool(vgpo_cfg.get("use_vpr_in_gate", True))
+        use_vsr = bool(vgpo_cfg.get("use_vsr_in_gate", True))
+        w_vpr = float(vgpo_cfg.get("w_vpr", 0.5))
+        w_vsr = float(vgpo_cfg.get("w_vsr", 0.5))
+
+        score_vpr = 0.0
+        score_vsr = 0.0
+
+        if use_vpr:
+            try:
+                score_vpr = float(para_reward_score("vgpo", pred_watch_text, gt_text))
+            except Exception:
+                score_vpr = 0.0
+
+        if use_vsr:
+            # It should:
+            # 1) build embedding(image_gt)
+            # 2) render(pred_watch_text) -> image_pred -> embedding
+            # 3) cosine similarity
+            try:
+                from reward.vgpo_reward import vsr_score
+                score_vsr = float(vsr_score("vgpo", pred_watch_text, gt_text, extra_info=image_info))
+            except Exception:
+                score_vsr = 0.0
+
+        return w_vpr * score_vpr + w_vsr * score_vsr
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @DistProfiler.annotate(color="red", role="vgpo_rollout_generate")
+    def generate_sequences(self, prompts: DataProto):
+        """
+        Overrides base generate_sequences:
+          - If vgpo.enable: do gated two-stage generation
+          - Else: fallback to vanilla rollout
+        """
+        vgpo_cfg = self._get_vgpo_cfg()
+        if not bool(vgpo_cfg.get("enable", False)):
+            return super().generate_sequences(prompts)
+
+        prompts = prompts.to(get_device_id())
+        assert self._is_rollout
+
+        max_trials = int(vgpo_cfg.get("max_trials", 4))
+        gate_tau = float(vgpo_cfg.get("gate_tau", 0.65))
+
+        watch_stop = vgpo_cfg.get("watch_stop", ["</WATCHING>"])
+        reason_stop = vgpo_cfg.get("reason_stop", ["</ANSWER>"])
+
+        watch_max_new_tokens = int(vgpo_cfg.get("watch_max_new_tokens", 512))
+        reason_max_new_tokens = int(vgpo_cfg.get("reason_max_new_tokens", 1024))
+
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        pad_id = int(pad_id)
+
+
+        # -----------------------
+        # Stage-1: WATCHING trials
+        # -----------------------
+        best_watch_ids = None        # (B*n, Tw)
+        best_watch_mask = None       # (B*n, Tw)
+        best_scores = None           # (B*n,)
+
+        # We need GT watching text for VPR gate (training-time gate).
+        # We assume ground_truth is accessible in prompts.non_tensor_batch.
+        # If your dataset uses a different field name, change here.
+
+        gt_text_raw = None
+        img_info_raw = None
+        if hasattr(prompts, "non_tensor_batch") and prompts.non_tensor_batch is not None:
+            gt_text_raw = prompts.non_tensor_batch.get("ground_truth", None)
+            img_info_raw = prompts.non_tensor_batch.get("images", None)
+
+        gt_text_list = None
+        image_info_list = None
+
+        for t in range(max_trials):
+            with self.rollout_sharding_manager:
+                watch_prompts = self._with_rollout_overrides(
+                    prompts,
+                    {"stop_strings": watch_stop, "max_new_tokens": watch_max_new_tokens},
+                )
+                watch_out = self.rollout.generate_sequences(prompts=watch_prompts)
+
+            watch_out = watch_out.to("cpu")
+            watch_ids = watch_out.batch["responses"]  # (Bn, Tw)
+            Bn = watch_ids.size(0)
+            n = int(getattr(self.config.rollout, "n", 1))
+
+
+            if gt_text_list is None:
+                gt_text_list = _expand_list_to_bn(gt_text_raw, bn=Bn, n=n, fill="")
+            if image_info_list is None:
+                image_info_list = _expand_list_to_bn(img_info_raw, bn=Bn, n=n, fill=None)
+
+            # decode -> watch_only_texts
+            watch_mask = watch_out.batch.get("attention_mask", None)
+            if watch_mask is None:
+                watch_mask = (watch_ids != pad_id).long()
+
+            watch_texts = _decode_responses(self.tokenizer, watch_ids, watch_mask)
+
+            watch_only_texts = []
+            for s in watch_texts:
+                w = extract_xml_block(s, "WATCHING") or s
+                w = "<WATCHING>\n" + w.strip() + "\n</WATCHING>"
+                watch_only_texts.append(w)
+
+            scores = []
+            for i in range(Bn):
+                gt_i = gt_text_list[i]
+                img_i = image_info_list[i]
+                svis = self._gate_score(gt_text=gt_i, pred_watch_text=watch_only_texts[i], image_info=img_i)
+                scores.append(float(svis))
+            scores = torch.tensor(scores, dtype=torch.float32)
+
+
+
+            if best_scores is None:
+                best_scores = scores.clone()
+                best_watch_ids = watch_ids.clone()
+                best_watch_mask = watch_mask.clone()
+            else:
+                improved = scores > best_scores
+                if improved.any():
+                    best_scores[improved] = scores[improved]
+                    best_watch_ids[improved] = watch_ids[improved]
+                    best_watch_mask[improved] = watch_mask[improved]
+
+            # Early accept if all pass tau
+            if (best_scores >= gate_tau).all():
+                break
+
+        assert best_watch_ids is not None
+
+        Bn = best_watch_ids.size(0)
+        n = int(getattr(self.config.rollout, "n", 1))
+
+
+        prompts_cpu = prompts.to("cpu")
+        prompts_bn = _expand_dataproto_to_bn(prompts_cpu, bn=Bn, n=n)
+
+        # Convert best_watch_ids -> best watch text (for prompt concat in stage-2)
+        best_watch_texts = _decode_responses(self.tokenizer, best_watch_ids, best_watch_mask)
+
+        # Ensure we keep only WATCHING block
+        best_watch_blocks = []
+        for s in best_watch_texts:
+            w = extract_xml_block(s, "WATCHING")
+            if not w:
+                w = s
+            blk = "<WATCHING>\n" + w.strip() + "\n</WATCHING>\n"
+            best_watch_blocks.append(blk)
+
+        # Tokenize WATCHING blocks to ids (ragged -> pad)
+        watch_id_tensors = []
+        for blk in best_watch_blocks:
+            ids = torch.tensor(self.tokenizer.encode(blk, add_special_tokens=False), dtype=torch.long)
+            watch_id_tensors.append(ids)
+        watch_ids_padded = _pad_to_max_len(watch_id_tensors, pad_id=pad_id)
+        watch_mask_padded = (watch_ids_padded != pad_id).long()
+
+        # -----------------------
+        # Stage-2: generate THINKING+ANSWER conditioned on WATCHING
+        # -----------------------
+        # We must build "new prompts" = original input_ids + watch_ids (as context),
+        # then generate the remaining part.
+        base_input_ids = prompts_bn.batch["input_ids"]
+        base_attn = prompts_bn.batch["attention_mask"]
+
+
+        B = base_input_ids.size(0)
+        # Here we assume prompts are already expanded to B*n.
+        assert base_input_ids.size(0) == watch_ids_padded.size(0), (
+            f"Mismatch: base_input_ids={base_input_ids.size(0)} vs watch={watch_ids_padded.size(0)}. "
+            "If your prompts are not expanded, you must expand watch_ids per prompt and per sequence."
+        )
+
+        # Concatenate prompt ids + watch ids
+        concat_input_ids = []
+        for i in range(base_input_ids.size(0)):
+            # take valid prompt part
+            valid_prompt_len = int(base_attn[i].sum().item())
+            p = base_input_ids[i, :valid_prompt_len]
+            w = watch_ids_padded[i, : int(watch_mask_padded[i].sum().item())]
+            concat_input_ids.append(torch.cat([p, w], dim=0))
+
+        concat_input_ids = _pad_to_max_len(concat_input_ids, pad_id=pad_id)
+
+        concat_attn = (concat_input_ids != pad_id).long()
+        concat_pos = compute_position_id_with_mask(concat_attn)
+        device = get_torch_device() 
+
+        reason_tensors = {}
+        for k in prompts_bn.batch.keys():
+            if k in ("input_ids", "attention_mask", "position_ids"):
+                continue
+            reason_tensors[k] = prompts_bn.batch[k]
+
+        reason_tensors.update(
+            {
+                "input_ids": concat_input_ids.to(device),
+                "attention_mask": concat_attn.to(device),
+                "position_ids": concat_pos.to(device),
+            }
+        )
+
+        reason_prompts = DataProto.from_dict(
+            tensors=reason_tensors,
+            meta_info=dict(prompts.meta_info) if prompts.meta_info is not None else {},
+        )
+
+
+        reason_prompts.non_tensor_batch = prompts_bn.non_tensor_batch
+
+
+
+        with self.rollout_sharding_manager:
+            reason_prompts = self._with_rollout_overrides(
+                reason_prompts,
+                {
+                    "stop_strings": reason_stop,
+                    "max_new_tokens": reason_max_new_tokens,
+                    "n": 1,
+                },
+            )
+            reason_out = self.rollout.generate_sequences(prompts=reason_prompts)
+
+        reason_out = reason_out.to("cpu")
+        reason_ids = reason_out.batch["responses"]
+        reason_mask = (reason_ids != pad_id).long()
+
+        # -----------------------
+        # Final: response = WATCHING + REASON
+        # Rebuild final (prompt + full_response) so downstream log_prob/reward is consistent.
+        # -----------------------
+        full_resp_ids_list = []
+        for i in range(reason_ids.size(0)):
+            w = watch_ids_padded[i, : int(watch_mask_padded[i].sum().item())]
+            r = reason_ids[i, : int(reason_mask[i].sum().item())]
+            full_resp_ids_list.append(torch.cat([w, r], dim=0))
+
+        full_resp_ids = _pad_to_max_len(full_resp_ids_list, pad_id=pad_id)
+        full_resp_mask = (full_resp_ids != pad_id).long()
+
+        # Now rebuild final input_ids = original prompt + full_resp
+        final_input_ids_list = []
+        base_input_ids = prompts_bn.batch["input_ids"].to("cpu")
+        base_attn = prompts_bn.batch["attention_mask"].to("cpu")
+
+        final_input_ids_list = []
+        for i in range(Bn):
+            valid_prompt_len = int(base_attn[i].sum().item())
+            p = base_input_ids[i, :valid_prompt_len]
+            y = full_resp_ids[i, : int(full_resp_mask[i].sum().item())]
+            final_input_ids_list.append(torch.cat([p, y], dim=0))
+
+        final_input_ids = _pad_to_max_len(final_input_ids_list, pad_id=pad_id)
+        final_attn = (final_input_ids != pad_id).long()
+        final_pos = compute_position_id_with_mask(final_attn)
+
+
+        out_tensors = {}
+        for k in prompts_bn.batch.keys():
+            if k in ("input_ids", "attention_mask", "position_ids"):
+                continue
+            out_tensors[k] = prompts_bn.batch[k]
+
+        out_tensors.update(
+            {
+                "input_ids": final_input_ids,
+                "attention_mask": final_attn,
+                "position_ids": final_pos,
+                "responses": full_resp_ids,
+            }
+        )
+
+        out = DataProto.from_dict(
+            tensors=out_tensors,
+            meta_info=reason_out.meta_info,
+        )
+        out.non_tensor_batch = prompts_bn.non_tensor_batch
+
+
+        out = out.to("cpu")
+        get_torch_device().empty_cache()
+        return out

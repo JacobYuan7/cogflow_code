@@ -1046,6 +1046,11 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
+        # 初始化 Tracking 对象，用于记录实验的指标和配置  
+        # project_name: 项目名称，从配置中获取  
+        # experiment_name: 实验名称，从配置中获取  
+        # default_backend: 日志记录的后端，从配置中获取 (例如，wandb, tensorboard)  
+        # config: 将 OmegaConf 配置对象转换为字典，并解析所有变量  
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -1053,26 +1058,41 @@ class RayPPOTrainer:
             config=OmegaConf.to_container(self.config, resolve=True),
         )
 
+        # 初始化全局训练步数 
         self.global_steps = 0
+
 
         # load checkpoint before doing anything
         self._load_checkpoint()
 
+        # 在训练开始前执行验证  
+        # 目前，我们只支持使用 reward_function 进行验证。  
+        # 如果配置了验证奖励函数 (self.val_reward_fn) 并且配置允许在训练前验证  
         # perform validation before training
         # currently, we only support validation using the reward_function.
+
+
         if self.val_reward_fn is not None and self.config.trainer.get("val_before_train", True):
+            # 调用 _validate 方法执行验证  
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
+            # 打印初始验证指标  
             pprint(f"Initial validation metrics: {val_metrics}")
+            # 使用 logger 记录验证指标 
             logger.log(data=val_metrics, step=self.global_steps)
+            # 如果配置了 'val_only' 为 True，则只进行验证，不进行训练，直接返回  
             if self.config.trainer.get("val_only", False):
                 return
 
+        # 如果配置了 'skip_rollout' 为 True，则跳过 rollout 过程  
         if self.config.actor_rollout_ref.rollout.get("skip_rollout", False):
             rollout_skip = RolloutSkip(self.config, self.actor_rollout_wg)
             rollout_skip.wrap_generate_sequences()
 
-        # add tqdm
+        # 添加 tqdm 进度条，用于显示训练进度  
+        # total: 总训练步数，从配置中获取  
+        # initial: 初始步数，从全局训练步数 self.global_steps 获取  
+        # desc: 进度条描述，显示 "Training Progress"  
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
         # we start from step 1
@@ -1088,11 +1108,40 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        # 开始训练循环，遍历所有 epoch  
+        # 每个 epoch 中，遍历数据加载器中的所有批次  
+        # 在每个批次中，执行以下步骤：  
+        # 1. 初始化指标字典 metrics 和计时器 timing_raw  
+        # 2. 根据配置决定是否启用性能分析  
+        # 3. 从 batch_dict 创建 DataProto 对象 batch  
+        # 4. 为 batch 添加唯一标识符 uid  
+        # 5. 从 batch 中移除不必要的键，准备用于生成  
+        # 6. 重复生成 n 次，并记录计时信息  
+        # 7. 计算奖励模型得分  
+        # 8. 平衡批次内的 token 数量  
+        # 9. 计算全局有效 token 数量  
+        # 10. 计算奖励模型得分  
+        # 11. 计算旧对数概率  
+        # 12. 计算参考策略的对数概率  
+        # 13. 计算价值函数  
+        # 14. 更新评论家  
+        # 15. 更新演员  
+        # 16. 记录生成数据  
+        # 17. 更新进度条  
+        # 18. 检查是否达到最大步数  
+        # 19. 如果达到最大步数，则保存模型  
+
         for epoch in range(self.config.trainer.total_epochs):
+            # 内层循环：遍历训练数据加载器中的每个批次 (batch) 
             for batch_dict in self.train_dataloader:
+                # 打印当前的 epoch 和全局步数  
                 metrics = {}
                 timing_raw = {}
 
+                # 开始性能分析  
+                # 如果配置了全局性能分析，并且当前步数需要分析，则启动性能分析  
+                # 如果配置了连续步骤性能分析，则根据当前步数决定是否启动  
+                # 如果配置了连续步骤性能分析，则根据当前步数决定是否启动  
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
                         not prev_step_profile and curr_step_profile
@@ -1100,14 +1149,18 @@ class RayPPOTrainer:
                         else curr_step_profile
                     )
 
+                # 将从 dataloader 获取的字典转换为 DataProto 对象，这是一种自定义的数据结构  
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
+                # 为 batch 添加唯一标识符 uid  
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
                 )
 
                 # pop those keys for generation
+                # 从批次数据中弹出用于序列生成的键 ('input_ids', 'attention_mask', 'position_ids')  
+                # 这些键对应的数据将用于 actor 模型生成响应序列    
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
                 if "multi_modal_data" in batch.non_tensor_batch:
@@ -1130,20 +1183,34 @@ class RayPPOTrainer:
 
                 # pass global_steps to trace
                 gen_batch.meta_info["global_steps"] = self.global_steps
+                
+                # 添加beam search设置
+                gen_batch.meta_info["use_beam_search"] = True
+                gen_batch.meta_info["beam_width"] = 5  # 设置beam宽度，可以根据需要调整
+                
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps
 
                 with marked_timer("step", timing_raw):
                     # generate a batch
+                    # 生成一个批次的数据  
+                    # 如果配置了异步 rollout 模式，则使用异步 rollout 管理器生成序列  
+                    # 否则，使用 actor_rollout_wg 生成序列  
+                    # 记录生成序列的计时信息  
+                    # 从生成序列中移除计时信息  
                     with marked_timer("gen", timing_raw, color="red"):
+                         # 调用 actor_rollout_wg (Actor-Rollout Worker Group) 的 generate_sequences 方法生成响应序列  
                         if not self.async_rollout_mode:
                             gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
                         else:
                             gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
-
+                    # 如果配置了 REMAX 优势估计器，则计算基准奖励  
+                    # 如果奖励函数为空，则抛出错误  
+                    # 记录生成基准序列的计时信息  
+                    # 从生成基准序列中移除计时信息  
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         if self.reward_fn is None:
                             raise ValueError("A reward_fn is required for REMAX advantage estimation.")
@@ -1165,10 +1232,13 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    # repeat to align with repeated responses in rollout
+                    # 根据配置中的 rollout.n (每个 prompt 生成的响应数量) 重复批次数据，以与 rollout 过程中生成的多个响应对齐  
+                    # interleave=True 表示交错重复  
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
+                    # 将生成序列与原始批次数据合并  
                     batch = batch.union(gen_batch_output)
 
+                    # 计算响应掩码，用于后续的损失计算  
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
                     # Balance the number of valid tokens across DP ranks.
@@ -1210,10 +1280,12 @@ class RayPPOTrainer:
                             from verl.utils.debug.metrics import calculate_debug_metrics
 
                             metrics.update(calculate_debug_metrics(batch))
-
+                    # 3. 如果使用参考策略 (Reference Policy)  
                     if self.use_reference_policy:
                         # compute reference log_prob
+                        # 计算参考策略的对数概率  
                         with marked_timer("ref", timing_raw, color="olive"):
+                            # 用 ref_policy_wg (Reference Policy Worker Group) 计算参考 log_prob  
                             if not self.ref_in_actor:
                                 ref_log_prob = self.ref_policy_wg.compute_ref_log_prob(batch)
                             else:

@@ -185,6 +185,11 @@ class RaySPPOTrainer(RayPPOTrainer):
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
                 )
+                
+                # # 添加beam search设置
+                # gen_batch.meta_info["use_beam_search"] = True
+                # gen_batch.meta_info["beam_width"] = 5  # 设置beam宽度，可以根据需要调整
+                
                 gen_batch = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
                 is_last_step = self.global_steps >= self.total_training_steps

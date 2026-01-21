@@ -66,7 +66,7 @@ def run_ppo(config) -> None:
     # Create a remote instance of the TaskRunner class, and
     # Execute the `run` method of the TaskRunner instance remotely and wait for it to complete
     if (
-        is_cuda_available
+        is_cuda_available()
         and config.global_profiler.tool == "nsys"
         and config.global_profiler.get("steps") is not None
         and len(config.global_profiler.get("steps", [])) > 0
@@ -110,13 +110,20 @@ class TaskRunner:
         from verl.single_controller.ray import RayWorkerGroup
 
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            from verl.workers.fsdp_workers import ActorRolloutRefWorker, AsyncActorRolloutRefWorker
-
-            actor_rollout_cls = (
-                AsyncActorRolloutRefWorker
-                if config.actor_rollout_ref.rollout.mode == "async"
-                else ActorRolloutRefWorker
+            from verl.workers.fsdp_workers import (
+                ActorRolloutRefWorker,
+                AsyncActorRolloutRefWorker,
+                VGPOActorRolloutRefWorker,
             )
+
+            use_vgpo = bool(config.actor_rollout_ref.rollout.get("vgpo", {}).get("enable", False))
+
+            if use_vgpo:
+                assert config.actor_rollout_ref.rollout.mode != "async", "VGPO currently only supports sync rollout"
+                actor_rollout_cls = VGPOActorRolloutRefWorker
+            else:
+                actor_rollout_cls = AsyncActorRolloutRefWorker if config.actor_rollout_ref.rollout.mode == "async" else ActorRolloutRefWorker
+
             ray_worker_group_cls = RayWorkerGroup
 
         elif config.actor_rollout_ref.actor.strategy == "megatron":

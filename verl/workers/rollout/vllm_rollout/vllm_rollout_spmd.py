@@ -240,7 +240,7 @@ class vLLMRollout(BaseRollout):
 
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
-    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+    def generate_sequences(self, prompts: DataProto, **_unused_kwargs) -> DataProto:
         """Generate sequences for a batch of prompts.
 
         Args:
@@ -300,26 +300,73 @@ class vLLMRollout(BaseRollout):
 
             input_data["prompt_token_ids"] = list(input_data["prompt_token_ids"])
 
+        # ======== batch-level sampling control (DO NOT put inside the for-loop) ========
         do_sample = prompts.meta_info.get("do_sample", True)
         is_validate = prompts.meta_info.get("validate", False)
-        if not do_sample:
-            kwargs = {
+
+        sampling_kwargs = {}
+
+        # (optional) pseudo beam-search / best-of
+        if prompts.meta_info.get("use_beam_search", False):
+            beam_width = int(prompts.meta_info.get("beam_width", 5))
+            sampling_kwargs.update({
+                "best_of": beam_width,
+                "n": 1,
+                "temperature": 0,
+                "top_p": 1.0,
+                "top_k": -1,
+                # 如果你 vLLM 版本支持真正 beam search，可以加：
+                # "use_beam_search": True,
+            })
+
+        elif not do_sample:
+            sampling_kwargs.update({
                 "best_of": 1,
                 "top_p": 1.0,
                 "top_k": -1,
                 "min_p": 0.0,
                 "temperature": 0,
-                "n": 1,  # if greedy, only 1 response
-            }
+                "n": 1,
+            })
+
         elif is_validate:
-            # TODO: try **
-            kwargs = {
+            sampling_kwargs.update({
                 "top_k": self.config.val_kwargs.top_k,
                 "top_p": self.config.val_kwargs.top_p,
                 "temperature": self.config.val_kwargs.temperature,
-                "n": 1,  # if validate, already repeat in ray_trainer
-            }
+                "n": 1,
+            })
 
+        # ==============================
+        # ✅ sampling_overrides support
+        # ==============================
+        over = prompts.meta_info.get("sampling_overrides", None)
+        if over:
+            # stop_strings -> stop
+            stop_strings = over.get("stop_strings", None)
+            if stop_strings:
+                if isinstance(stop_strings, str):
+                    stop_list = [stop_strings]
+                else:
+                    stop_list = list(stop_strings)
+                sampling_kwargs["stop"] = stop_list
+
+                # stop字符串匹配需要 detokenize 才更稳
+                sampling_kwargs["detokenize"] = True
+
+            # max_new_tokens -> max_tokens
+            max_new_tokens = over.get("max_new_tokens", None)
+            if max_new_tokens is not None:
+                max_new_tokens = int(max_new_tokens)
+                max_new_tokens = max(1, min(max_new_tokens, int(self.config.response_length)))
+                sampling_kwargs["max_tokens"] = max_new_tokens
+
+            # optional overrides
+            for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "frequency_penalty"]:
+                if k in over and over[k] is not None:
+                    sampling_kwargs[k] = over[k]
+
+        # ======== LoRA request (keep as-is) ========
         lora_requests = None
         if self.lora_kwargs:
             lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
@@ -329,10 +376,13 @@ class vLLMRollout(BaseRollout):
                     LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")
                 ] * batch_size
 
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
+        if over:
+            print(">>> sampling_overrides applied:", over, "->", sampling_kwargs)
+
+        # ✅ 关键：这里必须用 sampling_kwargs
+        with self.update_sampling_params(**sampling_kwargs):
             outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
+                prompts=vllm_inputs,
                 sampling_params=self.sampling_params,
                 lora_request=lora_requests,
                 use_tqdm=False,
@@ -340,7 +390,6 @@ class vLLMRollout(BaseRollout):
 
             # TODO(sgm): disable logprob when recompute_log_prob is enable
             # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-
             response = []
             rollout_log_probs = []
             for output in outputs:
