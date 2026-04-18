@@ -1,6 +1,18 @@
-# CogFlow RL (VERL + vLLM) 
+# CogFlow
 
-This repository supports **PPO-like / VGPO reinforcement learning** training  for text / multimodal models.  
+<b>CogFlow: Bridging Perception and Reasoning through Knowledge Internalization for Visual Mathematical Problem Solving</b> <br/>
+[Shuhang Chen](https://scholar.google.com/citations?user=tt0czd0AAAAJ&hl=zh-CN),[Yunqiu Xu](https://scholar.google.com/citations?user=SdJX4nAAAAAJ&hl=zh-CN),Junjie Xie, Aojun Lu,Tao Feng,    Zeying Huang, Ning Zhang, Yi Sun,  [Yi Yang](https://scholar.google.com/citations?user=RMSuNFwAAAAJ&hl=en) and [Hangjie Yuan](https://scholar.google.com/citations?user=jQ3bFDMAAAAJ&hl=en) <br/>
+ICLR 2026 <br/>
+![image](figure/pipeline_01.jpg)
+[paper](https://arxiv.org/pdf/2601.01874) | [code](https://github.com/ShChen233/cogflow_code)
+
+
+
+
+## 👀 About CogFlow
+Despite recent advances, multimodal large language models continue to struggle with visual mathematical problem solving. Some recent works recognize that visual perception is a bottleneck in visual mathematical reasoning, but their solutions are limited to improving the extraction and interpretation of visual inputs. Notably, they all ignore the key issue of whether the extracted visual cues are faithfully integrated and properly utilized in subsequent reasoning. Motivated by this, we present CogFlow, a novel cognitive-inspired three-stage framework that incorporates a knowledge internalization stage, explicitly simulating the hierarchical flow of human reasoning: perception ⇒ internalization ⇒ reasoning. In line with this hierarchical flow, we holistically enhance all its stages. We devise synergistic visual rewards to boost perception capabilities in parametric and semantic spaces, jointly improving visual information extraction from symbols and diagrams. To guarantee faithful integration of extracted visual cues into subsequent reasoning, we introduce a visual-anchored reward model in the internalization stage, bridging perception and reasoning. Moreover, we design a visual-gated policy optimization algorithm to further enforce the reasoning is grounded with the visual knowledge, preventing models seeking shortcuts that appear coherent but are visually ungrounded reasoning chains. Moreover, we contribute a new dataset MathCog for model training, which contains samples with over 120K high-quality perception-reasoning aligned annotations. Comprehensive experiments and analysis on three commonly used visual mathematical reasoning benchmarks validate the superiority of the proposed CogFlow.
+
+![image](figure/framework.jpg)
 
 ## 1. Repository Structure
 
@@ -29,6 +41,20 @@ The structure below matches the current repository layout:
 ├── requirements_sglang.txt
 ├── requirements-npu.txt
 ├── setup.py
+├──evaluation/ ✅ To evaluate CogFlow on FlowVerse, MathVerse and other benchmark
+│ ├── build_query.py
+│ ├── extract_answer_s1.py
+│ ├── extract_answer.sh
+│ ├── generate_response.sh
+│ ├── generate_response.py
+│ ├── score_answer_s2.py
+│ ├── score_answer_s2.sh
+│ ├── score_final.py
+│ ├── score_final.sh
+│ └── prompt.py
+├──evaluation_models/
+│ ├── CogFlow.py
+│ └── gpt.py
 └── README.md
 ```
 
@@ -152,16 +178,55 @@ Artifacts usage:
 
 - IntlzR reward model: can be invoked inside reward/vgpo_reward.py or src/infer.py
 
-# 10. Output & Logging
-## 10.1 Training Outputs
-
-Training outputs include:
-
-logs: outputs/ or exp_log/
-
-checkpoints: outputs/ckpt/ (depends on your trainer configs)
+# 10. Evaluation on Benchmark
 
 
+
+We provide the code to reproduce the results reported in our paper on the FlowVerse, MathVerse, and other benchmark datasets. The evaluation pipeline relies on advanced large language models (e.g., [ChatGPT/GPT-4](https://platform.openai.com/account/api-keys))  to extract and match model answers. Below, we use the evaluation of the FlowVerse dataset as an example.
+
+There are two steps for the evaluation of 'Acc' scores and 'CoT-E' scores of FlowVerse:
+#### Step1: Answer Obtain
+```bash
+cd evaluation 
+python generate_response.py \
+--data_dir PATH_TO_DATA_DIR \
+--input_file PATH_TO_INPUT_FILE \
+--output_dir PATH_TO_OUTPUT_DIR \
+--output_file PATH_TO_OUTPUT_FILE \
+--mode MODE_OF_FLOWVERSE \
+--img_dir PATH_TO_IMG_DIR \
+```
+
+#### Step2: Answer Extraction
+```bash
+python extract_answer_s1.py \
+--model_output_file PATH_TO_OUTPUT_FILE \
+--output_file PATH_TO_GENERATED_FILE \
+--mode MODE_OF_FLOWVERSE \
+--save_file PATH_TO_ENTRACTION_FILE \
+```
+
+
+#### Step3: Answer Scoring
+
+```bash
+python score_answer_s2.py \
+--save_file PATH_TO_SCORE_FILE \
+--mode MODE_OF_FLOWVERSE \
+--output_dir PATH_TO_OUTPUT_DIR \
+--output_file PATH_TO_SCORE_FILE \
+--trunk_response 30 \
+--save_every 10 \
+```
+#### Step4: Answer Statistics
+
+```bash
+python score_final.py \
+--data_dir PATH_TO_DATA_DIR \
+--input_file PATH_TO_INPUT_FILE \
+--save_file PATH_TO_SCORE_FILE \
+--mode MODE_OF_FLOWVERSE 
+```
 
 
 # License
