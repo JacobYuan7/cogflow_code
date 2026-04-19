@@ -1,4 +1,4 @@
-# CogFlow
+# [ICLR-26] CogFlow
 
 <b>CogFlow: Bridging Perception and Reasoning through Knowledge Internalization for Visual Mathematical Problem Solving</b> <br/>
 [Shuhang Chen](https://scholar.google.com/citations?user=tt0czd0AAAAJ&hl=zh-CN),[Yunqiu Xu](https://scholar.google.com/citations?user=SdJX4nAAAAAJ&hl=zh-CN),Junjie Xie, Aojun Lu,Tao Feng,    Zeying Huang, Ning Zhang, Yi Sun,  [Yi Yang](https://scholar.google.com/citations?user=RMSuNFwAAAAJ&hl=en) and [Hangjie Yuan](https://scholar.google.com/citations?user=jQ3bFDMAAAAJ&hl=en) <br/>
@@ -236,9 +236,10 @@ This project contains ByteDance VERL code and follows the Apache 2.0 License.
 
 # Citation 
 ```bibtex
-@article{chen2026cogflow,
-  title   = {CogFlow: Bridging Perception and Reasoning through Knowledge Internalization for Visual Mathematical Problem Solving},
-  author  = {Chen, Shuhang and Xu, Yunqiu and Xie, Junjie and Lu, Aojun and Feng, Tao and Huang, Zeying and Zhang, Ning and Sun, Yi and Yang, Yi and Yuan, Hangjie},
-  journal = {arXiv preprint arXiv:2601.01874},
-  year    = {2026}
+@inproceedings{chen2026cogflow,
+  title={CogFlow: Bridging Perception and Reasoning through Knowledge Internalization for Visual Mathematical Problem Solving},
+  author={Chen, Shuhang and Xu, Yunqiu and Xie, Junjie and Lu, Aojun and Feng, Tao and Huang, Zeying and Zhang, Ning and Sun, Yi and Yang, Yi and Yuan, Hangjie},
+  booktitle={The Fourteenth International Conference on Learning Representations}
 }
+
+```
